@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#161c19" />
+    <title>王国崛起</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <span class="eyebrow">KINGDOM RISE</span>
+          <h1>王国崛起 <small>V0.1</small></h1>
+        </div>
+        <p>20 × 20 方格地图</p>
+      </header>
+      <section id="game" aria-label="游戏地图"></section>
+      <footer>
+        <span>左键选择 / 取消选择</span>
+        <span>选中后左键资源点采集</span>
+        <span>右键移动</span>
+        <span>中键拖动地图</span>
+        <span>滚轮缩放</span>
+      </footer>
+    </main>
+    <aside id="developer-console" class="developer-console" aria-label="游戏调试与场景验证平台">
+      <header class="dev-header">
+        <div>
+          <span class="dev-kicker">DEVELOPER CONSOLE</span>
+          <h2>世界调试台 <span id="dev-runtime-status" data-state="running">RUNNING</span></h2>
+        </div>
+        <button type="button" class="dev-icon-button" data-dev-action="collapse" title="收起调试台">⌁</button>
+      </header>
+      <div class="dev-body">
+        <section class="dev-metrics" aria-label="运行指标">
+          <article><span>FPS</span><strong id="dev-fps">--</strong></article>
+          <article><span>Ticks</span><strong id="dev-ticks">0</strong></article>
+          <article><span>居民</span><strong id="dev-unit-count">0</strong></article>
+          <article><span>路线</span><strong id="dev-order-count">0</strong></article>
+        </section>
+
+        <details open>
+          <summary>模拟控制</summary>
+          <div class="dev-section dev-control-grid">
+            <button type="button" data-dev-action="toggle-pause">暂停</button>
+            <button type="button" data-dev-action="step">单步 +1 tick</button>
+            <label>运行速度
+              <select id="dev-speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <label>路线显示
+              <select id="dev-path-mode">
+                <option value="off">仅手动命令</option>
+                <option value="selected">选中实体</option>
+                <option value="all">全部实体</option>
+              </select>
+            </label>
+            <button type="button" data-dev-action="spawn-unit">生成居民</button>
+            <button type="button" data-dev-action="gather-all">全部采集</button>
+            <label class="dev-toggle"><input id="dev-map-edit" type="checkbox" /> 编辑地图障碍</label>
+            <button type="button" class="danger" data-dev-action="reset">恢复初始世界</button>
+          </div>
+        </details>
+
+        <details open>
+          <summary>验证场景</summary>
+          <div class="dev-section dev-scenarios">
+            <button type="button" data-dev-scenario="multi-gather"><strong>双人采集</strong><small>共享资源与仓库</small></button>
+            <button type="button" data-dev-scenario="detour"><strong>障碍绕路</strong><small>路径节点与终点</small></button>
+            <button type="button" data-dev-scenario="warehouse-near-full"><strong>仓库边界</strong><small>并发交付不超容</small></button>
+            <button type="button" data-dev-scenario="blocked-path"><strong>完全阻断</strong><small>不可达命令拒绝</small></button>
+          </div>
+          <p id="dev-scenario-result" class="dev-result" data-state="idle">尚未运行验证场景</p>
+        </details>
+
+        <details open>
+          <summary>世界状态 <span class="dev-inline-stats">木材 <b id="dev-resource">--</b> · 仓库 <b id="dev-warehouse">--</b></span></summary>
+          <div class="dev-section dev-table-wrap">
+            <table>
+              <thead><tr><th>实体</th><th>坐标</th><th>状态</th><th>组件摘要</th></tr></thead>
+              <tbody id="dev-entities"></tbody>
+            </table>
+          </div>
+        </details>
+
+        <details open>
+          <summary>系统诊断</summary>
+          <ul id="dev-systems" class="dev-systems"></ul>
+        </details>
+
+        <details open>
+          <summary>事件流 <button type="button" data-dev-action="clear-events">清空</button></summary>
+          <ul id="dev-events" class="dev-events" aria-live="polite"></ul>
+        </details>
+      </div>
+    </aside>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
