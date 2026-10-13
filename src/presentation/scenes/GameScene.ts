@@ -1,3 +1,10 @@
+/**
+ * Phaser 运行时的集成场景。
+ *
+ * 当前场景负责装配核心世界、固定步长模拟、输入意图、摄像机、绘制、DOM HUD 和
+ * Developer Console。游戏规则仍委托给 core 命令模块；场景保留的重置与验证逻辑
+ * 是现阶段调试入口，不代表已经形成通用的存档、场景或系统调度能力。
+ */
 import type { EntityId } from 'bitecs';
 import Phaser from 'phaser';
 import { cancelGatherCommand, issueGatherCommand, stepGathering } from '../../core/commands/gathering';
@@ -5,6 +12,7 @@ import { issueMoveCommand, stepMovement } from '../../core/commands/movement';
 import { GAME_CONFIG } from '../../core/config/gameConfig';
 import { despawnUnit, gameWorld, spawnUnit, type GatherTaskState } from '../../core/ecs/world';
 import { GridMap, type GridPosition, type WorldPosition, worldPixelsToPosition } from '../../core/map/GridMap';
+import { CameraController } from '../camera/CameraController';
 import {
   DeveloperConsole,
   type DeveloperAction,
@@ -12,7 +20,10 @@ import {
   type DeveloperSnapshot,
   type ScenarioName,
 } from '../debug/DeveloperConsole';
+import { GameInputController } from '../input/GameInputController';
+import { FloatingPanel } from '../ui/FloatingPanel';
 
+// GridMap 与 ECS 分别保存阻塞格和设施实体；当前通过同一初始化列表手动保持占地一致。
 const OBSTACLES: readonly GridPosition[] = [
   { x: 7, y: 4 }, { x: 7, y: 5 }, { x: 7, y: 6 }, { x: 7, y: 7 },
   { x: 8, y: 7 }, { x: 9, y: 7 },
@@ -41,19 +52,19 @@ export class GameScene extends Phaser.Scene {
   readonly #unitViews = new Map<EntityId, UnitView>();
   #mapGraphics!: Phaser.GameObjects.Graphics;
   #path!: Phaser.GameObjects.Graphics;
-  #status!: Phaser.GameObjects.Text;
-  #message!: Phaser.GameObjects.Text;
+  #status!: HTMLElement;
+  #message!: HTMLElement;
+  #statusPanel!: FloatingPanel;
+  #cameraController!: CameraController;
+  #inputController!: GameInputController;
   #resourceLabel!: Phaser.GameObjects.Text;
   #warehouseLabel!: Phaser.GameObjects.Text;
   #console!: DeveloperConsole;
   #selectedUnit: EntityId | null = null;
-  #panning = false;
   #mapEditing = false;
   #paused = false;
   #stepRequests = 0;
   #timeScale = 1;
-  #panX = 0;
-  #panY = 0;
   #accumulator = 0;
   #simulationTicks = 0;
   #consoleElapsedMs = 0;
@@ -63,31 +74,47 @@ export class GameScene extends Phaser.Scene {
     super('game');
   }
 
+  /** 创建视图与输入适配器，并将其生命周期绑定到 Phaser 场景。 */
   create(): void {
     const mapWidth = this.#map.width * GAME_CONFIG.tileSize;
     const mapHeight = this.#map.height * GAME_CONFIG.tileSize;
     const { Position } = gameWorld.components;
-    this.cameras.main.setBounds(0, 0, mapWidth, mapHeight);
+    this.#cameraController = new CameraController(this.cameras.main, { x: 0, y: 0, width: mapWidth, height: mapHeight });
     this.cameras.main.centerOn(
       (Position.x[gameWorld.leader]! + 0.5) * GAME_CONFIG.tileSize,
       (Position.y[gameWorld.leader]! + 0.5) * GAME_CONFIG.tileSize,
     );
-    this.input.mouse?.disableContextMenu();
+    this.#cameraController.constrainToWorld();
     this.#drawMap();
     this.#path = this.add.graphics();
     this.#createWorldObjects();
     for (const unit of gameWorld.units) this.#createUnitView(unit);
     this.#createHud();
     this.#bindDeveloperConsole();
-    this.#bindInput();
+    this.#inputController = new GameInputController(this.input, this.#cameraController, {
+      onPrimary: (pointer) => this.#handlePrimaryPointer(pointer),
+      onSecondary: (pointer) => this.#handleSecondaryPointer(pointer),
+    });
     this.#renderState();
     this.#console.update(this.#createDeveloperSnapshot());
+    this.scale.on(Phaser.Scale.Events.RESIZE, this.#handleResize, this);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.scale.off(Phaser.Scale.Events.RESIZE, this.#handleResize, this);
+      this.#inputController.destroy();
+      this.#statusPanel.destroy();
+      this.#console.destroy();
+    });
   }
 
+  /**
+   * Phaser 每帧入口。摄像机和渲染按帧更新，核心世界则以固定频率推进。
+   * 单帧最多累计 0.25 秒真实时间，再乘模拟倍速，避免长时间挂起后补算过多 Tick。
+   */
   update(_time: number, deltaMs: number): void {
     const step = 1 / GAME_CONFIG.simulationHz;
     const instantFps = deltaMs > 0 ? 1000 / deltaMs : this.#fps;
     this.#fps = this.#fps * 0.9 + instantFps * 0.1;
+    this.#cameraController.update(deltaMs);
     if (this.#paused) {
       if (this.#stepRequests > 0) {
         this.#stepSimulation(step);
@@ -109,78 +136,58 @@ export class GameScene extends Phaser.Scene {
   }
 
   #stepSimulation(step: number): void {
+    // 顺序是确定的：按 units 数组遍历，每个单位先移动、后采集。
+    // 因资源和仓库共享，该遍历顺序也会决定同一 Tick 内的资源竞争结果。
     for (const unit of gameWorld.units) {
-      stepMovement(gameWorld, unit, step);
+      stepMovement(gameWorld, this.#map, unit, step);
       stepGathering(gameWorld, this.#map, unit, step);
     }
     this.#simulationTicks += 1;
   }
 
-  #bindInput(): void {
-    this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
-      if (pointer.button === 1) {
-        this.#panning = true;
-        this.#panX = pointer.x;
-        this.#panY = pointer.y;
+  #handlePrimaryPointer(pointer: Phaser.Input.Pointer): void {
+    if (this.#mapEditing) {
+      this.#toggleObstacle(pointer);
+      return;
+    }
+    const clickedUnit = this.#findUnitAt(pointer);
+    if (clickedUnit !== null) {
+      this.#selectedUnit = clickedUnit;
+      this.#message.textContent = `已选中${this.#unitViews.get(clickedUnit)!.name}`;
+      return;
+    }
+    if (this.#isEntityAt(pointer, gameWorld.resourceNode)) {
+      if (this.#selectedUnit === null) {
+        this.#message.textContent = '请先选择一个角色';
         return;
       }
-      if (this.#mapEditing) {
-        if (pointer.button === 0) this.#toggleObstacle(pointer);
-        return;
-      }
-      if (pointer.button === 0) {
-        const clickedUnit = this.#findUnitAt(pointer);
-        if (clickedUnit !== null) {
-          this.#selectedUnit = clickedUnit;
-          this.#message.setText(`已选中${this.#unitViews.get(clickedUnit)!.name}`);
-          return;
-        }
-        if (this.#isEntityAt(pointer, gameWorld.resourceNode)) {
-          if (this.#selectedUnit === null) {
-            this.#message.setText('请先选择一个角色');
-            return;
-          }
-          const accepted = issueGatherCommand(gameWorld, this.#map, this.#selectedUnit, gameWorld.resourceNode, gameWorld.warehouse);
-          this.#message.setText(accepted ? '开始采集木材' : '无法采集：资源耗尽、仓库已满或路径受阻');
-          this.#console.log(`Command: #${this.#selectedUnit} 采集 ${accepted ? '已接受' : '被拒绝'}`, accepted ? 'ok' : 'warning');
-          return;
-        }
-        this.#selectedUnit = null;
-        this.#message.setText('未选择单位');
-        return;
-      }
-      if (pointer.button === 2 && this.#selectedUnit !== null) {
-        const target = this.#toWorldPosition(pointer);
-        cancelGatherCommand(gameWorld, this.#selectedUnit);
-        const accepted = issueMoveCommand(gameWorld, this.#map, this.#selectedUnit, target);
-        this.#message.setText(accepted ? `移动至 (${target.x.toFixed(1)}, ${target.y.toFixed(1)})` : '目标不可到达');
-        this.#console.log(
-          `Command: #${this.#selectedUnit} 移动 (${target.x.toFixed(1)}, ${target.y.toFixed(1)}) ${accepted ? '已接受' : '被拒绝'}`,
-          accepted ? 'ok' : 'warning',
-        );
-      }
-    });
-    this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-      if (!this.#panning || !pointer.middleButtonDown()) return;
-      const camera = this.cameras.main;
-      camera.scrollX += (this.#panX - pointer.x) / camera.zoom;
-      camera.scrollY += (this.#panY - pointer.y) / camera.zoom;
-      this.#panX = pointer.x;
-      this.#panY = pointer.y;
-    });
-    this.input.on('pointerup', (pointer: Phaser.Input.Pointer) => {
-      if (pointer.button === 1) this.#panning = false;
-    });
-    this.input.on('wheel', (_pointer: Phaser.Input.Pointer, _objects: unknown[], _dx: number, dy: number) => {
-      const camera = this.cameras.main;
-      camera.setZoom(Phaser.Math.Clamp(camera.zoom - dy * 0.001, 0.6, 1.8));
-    });
+      const accepted = issueGatherCommand(gameWorld, this.#map, this.#selectedUnit, gameWorld.resourceNode, gameWorld.warehouse);
+      this.#message.textContent = accepted ? '开始采集木材' : '无法采集：资源耗尽、仓库已满或路径受阻';
+      this.#console.log(`Command: #${this.#selectedUnit} 采集 ${accepted ? '已接受' : '被拒绝'}`, accepted ? 'ok' : 'warning');
+      return;
+    }
+    this.#selectedUnit = null;
+    this.#message.textContent = '未选择单位';
+  }
+
+  #handleSecondaryPointer(pointer: Phaser.Input.Pointer): void {
+    if (this.#mapEditing || this.#selectedUnit === null) return;
+    const target = this.#toWorldPosition(pointer);
+    cancelGatherCommand(gameWorld, this.#selectedUnit);
+    const accepted = issueMoveCommand(gameWorld, this.#map, this.#selectedUnit, target);
+    this.#message.textContent = accepted ? `移动至 (${target.x.toFixed(1)}, ${target.y.toFixed(1)})` : '目标不可到达';
+    this.#console.log(
+      `Command: #${this.#selectedUnit} 移动 (${target.x.toFixed(1)}, ${target.y.toFixed(1)}) ${accepted ? '已接受' : '被拒绝'}`,
+      accepted ? 'ok' : 'warning',
+    );
   }
 
   #bindDeveloperConsole(): void {
     const root = document.querySelector<HTMLElement>('#developer-console');
+    const viewport = document.querySelector<HTMLElement>('#game-ui');
     if (!root) throw new Error('Developer Console root is missing.');
-    this.#console = new DeveloperConsole(root, (action) => this.#handleDeveloperAction(action));
+    if (!viewport) throw new Error('Game UI root is missing.');
+    this.#console = new DeveloperConsole(root, viewport, (action) => this.#handleDeveloperAction(action));
   }
 
   #handleDeveloperAction(action: DeveloperAction): void {
@@ -198,7 +205,7 @@ export class GameScene extends Phaser.Scene {
       this.#spawnResident();
     } else if (action.type === 'set-map-editing') {
       this.#mapEditing = action.enabled;
-      this.#message.setText(action.enabled ? '地图编辑：左键切换障碍格' : '地图编辑已关闭');
+      this.#message.textContent = action.enabled ? '地图编辑：左键切换障碍格' : '地图编辑已关闭';
       this.#console.log(`Map: 编辑模式${action.enabled ? '开启' : '关闭'}`);
     } else if (action.type === 'gather-all') {
       this.#gatherAll();
@@ -261,13 +268,20 @@ export class GameScene extends Phaser.Scene {
   }
 
   #createHud(): void {
-    this.add.rectangle(18, 18, 230, 220, 0x111713, 0.92).setOrigin(0).setScrollFactor(0);
-    this.#status = this.add.text(34, 31, '', {
-      color: '#dfe9e2', fontFamily: 'system-ui, sans-serif', fontSize: '15px', lineSpacing: 7,
-    }).setScrollFactor(0);
-    this.#message = this.add.text(34, 207, '左键选择角色，再点击资源点', {
-      color: '#d7b760', fontFamily: 'system-ui, sans-serif', fontSize: '13px',
-    }).setScrollFactor(0);
+    const viewport = document.querySelector<HTMLElement>('#game-ui');
+    if (!viewport) throw new Error('Game UI root is missing.');
+    const content = document.createElement('div');
+    content.className = 'character-status';
+    this.#status = document.createElement('pre');
+    this.#message = document.createElement('p');
+    this.#message.textContent = '左键选择角色，再点击资源点';
+    content.append(this.#status, this.#message);
+    this.#statusPanel = new FloatingPanel(viewport, {
+      title: '角色状态',
+      triggerLabel: '展开或收起角色状态',
+      triggerText: '♟',
+      content,
+    });
   }
 
   #renderState(): void {
@@ -284,7 +298,7 @@ export class GameScene extends Phaser.Scene {
       view.container.setPosition((Position.x[unit]! + 0.5) * size, (Position.y[unit]! + 0.5) * size);
       view.selectionRing.setVisible(unit === this.#selectedUnit);
     }
-    this.#status.setText([
+    this.#status.textContent = [
       `${focusedView.name} · ${focusedUnit === gameWorld.leader ? '开拓者' : '居民'}`,
       `状态  ${task ? GATHER_STATUS[task.state] : order ? '移动中' : '待机'}`,
       `生命  ${Health.current[focusedUnit]}/${Health.maximum[focusedUnit]}`,
@@ -292,10 +306,11 @@ export class GameScene extends Phaser.Scene {
       `木材  ${ResourceNode.remaining[gameWorld.resourceNode]!.toFixed(1)}`,
       `仓库  ${Warehouse.stored[gameWorld.warehouse]!.toFixed(1)}/${Warehouse.capacity[gameWorld.warehouse]}`,
       `坐标  (${x.toFixed(1)}, ${y.toFixed(1)})`,
-    ]);
+    ].join('\n');
     this.#resourceLabel.setText(`木材 ${ResourceNode.remaining[gameWorld.resourceNode]!.toFixed(0)}`);
     this.#warehouseLabel.setText(`仓库 ${Warehouse.stored[gameWorld.warehouse]!.toFixed(0)}/${Warehouse.capacity[gameWorld.warehouse]}`);
     this.#path.clear();
+    // 绘制的是 movement 已裁剪后的剩余连续航点，不是 A* 返回的原始逐格路径。
     for (const unit of gameWorld.units) {
       const unitOrder = MoveOrder[unit];
       if (!unitOrder || !this.#shouldShowPath(unit, unitOrder.source)) continue;
@@ -322,7 +337,7 @@ export class GameScene extends Phaser.Scene {
     const unit = spawnUnit(gameWorld, position.x, position.y);
     this.#createUnitView(unit);
     this.#selectedUnit = unit;
-    this.#message.setText(`已生成并选中${this.#unitViews.get(unit)!.name}`);
+    this.#message.textContent = `已生成并选中${this.#unitViews.get(unit)!.name}`;
     this.#console.log(`ECS: 生成居民 #${unit} @ (${position.x}, ${position.y})`, 'ok');
   }
 
@@ -355,17 +370,19 @@ export class GameScene extends Phaser.Scene {
     this.#map.setBlocked(cell, blocked);
     for (const unit of gameWorld.units) cancelGatherCommand(gameWorld, unit);
     this.#drawMap();
-    this.#message.setText(`障碍格 (${cell.x}, ${cell.y}) ${blocked ? '已添加' : '已移除'}`);
+    this.#message.textContent = `障碍格 (${cell.x}, ${cell.y}) ${blocked ? '已添加' : '已移除'}`;
     this.#console.log(`Map: ${blocked ? '添加' : '移除'}障碍 (${cell.x}, ${cell.y})；活动命令已取消`, 'ok');
   }
 
   #gatherAll(): void {
     const accepted = gameWorld.units.filter((unit) => issueGatherCommand(gameWorld, this.#map, unit, gameWorld.resourceNode, gameWorld.warehouse)).length;
-    this.#message.setText(`已向 ${accepted}/${gameWorld.units.length} 个角色下达采集指令`);
+    this.#message.textContent = `已向 ${accepted}/${gameWorld.units.length} 个角色下达采集指令`;
     this.#console.log(`Command: 群体采集 ${accepted}/${gameWorld.units.length} 已接受`, accepted > 0 ? 'ok' : 'warning');
   }
 
   #resetWorld(announce = true): void {
+    // 调试重置直接恢复当前原型的已知初始状态：前两个单位被视为内建单位，
+    // 后续动态单位销毁；这不是可扩展的世界反序列化流程。
     for (const unit of [...gameWorld.units]) cancelGatherCommand(gameWorld, unit);
     for (const unit of gameWorld.units.slice(2)) {
       this.#unitViews.get(unit)?.container.destroy();
@@ -394,11 +411,12 @@ export class GameScene extends Phaser.Scene {
     this.#console.setPathMode('off');
     this.#console.setScenarioResult('尚未运行验证场景');
     this.#drawMap();
-    this.#message.setText('场景已恢复为初始状态');
+    this.#message.textContent = '场景已恢复为初始状态';
     if (announce) this.#console.log('World: 已恢复初始状态，无需刷新页面', 'ok');
   }
 
   #runScenario(scenario: ScenarioName): void {
+    // 验证场景会先重置并直接改写测试所需状态，仅用于交互式观察，不替代自动化测试。
     this.#resetWorld(false);
     let passed = true;
     let result = '';
@@ -425,10 +443,15 @@ export class GameScene extends Phaser.Scene {
     }
     this.#console.setScenarioResult(result, passed);
     this.#console.log(`Scenario: ${result}`, passed ? 'ok' : 'error');
-    this.#message.setText(result);
+    this.#message.textContent = result;
+  }
+
+  #handleResize(): void {
+    this.#cameraController.constrainToWorld();
   }
 
   #createDeveloperSnapshot(): DeveloperSnapshot {
+    // 调试台只消费字符串化快照；它不持有 ECS 状态，也不通过快照反向修改世界。
     const { Position, Health, MoveOrder, ResourceNode, Warehouse, Carrier, GatherTask } = gameWorld.components;
     const entities: DeveloperEntitySnapshot[] = gameWorld.units.map((unit) => {
       const order = MoveOrder[unit];
@@ -476,6 +499,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   #toWorldPosition(pointer: Phaser.Input.Pointer): WorldPosition {
+    // 输入先经 Phaser 摄像机从屏幕坐标转为世界像素，再换算为格中心为整数的连续坐标。
     const point = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
     return worldPixelsToPosition(point.x, point.y, GAME_CONFIG.tileSize);
   }

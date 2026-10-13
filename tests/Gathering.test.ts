@@ -25,9 +25,10 @@ describe('gathering', () => {
     expect(issueGatherCommand(world, map, world.leader, world.resourceNode, world.warehouse)).toBe(true);
     expect(world.components.MoveOrder[world.leader]?.source).toBe('task');
 
+    // 与 GameScene 保持相同的固定 Tick 顺序：先移动，随后让采集状态机观察到达结果。
     for (let tick = 0; tick < 2_000; tick += 1) {
       const deltaSeconds = 1 / GAME_CONFIG.simulationHz;
-      stepMovement(world, world.leader, deltaSeconds);
+      stepMovement(world, map, world.leader, deltaSeconds);
       stepGathering(world, map, world.leader, deltaSeconds);
 
       const unitPosition = { x: Position.x[world.leader]!, y: Position.y[world.leader]! };
@@ -82,10 +83,11 @@ describe('gathering', () => {
       expect(issueGatherCommand(world, map, unit, world.resourceNode, world.warehouse)).toBe(true);
     }
 
+    // 单位按 world.units 顺序共享并修改资源与仓库，验证逐单位结算仍不会突破全局上下限。
     for (let tick = 0; tick < 2_000; tick += 1) {
       const deltaSeconds = 1 / GAME_CONFIG.simulationHz;
       for (const unit of world.units) {
-        stepMovement(world, unit, deltaSeconds);
+        stepMovement(world, map, unit, deltaSeconds);
         stepGathering(world, map, unit, deltaSeconds);
         expect(map.isPointWalkable(
           { x: Position.x[unit]!, y: Position.y[unit]! },

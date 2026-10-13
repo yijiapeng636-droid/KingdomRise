@@ -1,15 +1,26 @@
+/**
+ * 定义核心 ECS 世界的组件存储与实体生命周期。
+ *
+ * 组件数组以 bitECS 的 EntityId 作为下标；`units` 仅维护参与单位模拟的实体顺序，
+ * 资源点和仓库虽然属于同一世界，但不会进入该列表。本模块只管理核心状态，
+ * 不负责输入、渲染或逐 Tick 推进规则。
+ */
 import { addComponent, addEntity, createWorld, removeEntity, type EntityId } from 'bitecs';
 import { GAME_CONFIG } from '../config/gameConfig';
 import type { WorldPosition } from '../map/GridMap';
 
+/** 单位当前持有的移动路径；路径坐标为连续世界坐标。 */
 export interface MoveOrderData {
+  /** 按访问顺序保存航点，`nextIndex` 指向下一待到达节点。 */
   path: WorldPosition[];
   nextIndex: number;
   source: MoveOrderSource;
 }
 
+/** `manual` 来自玩家命令，`task` 由采集状态机创建。 */
 export type MoveOrderSource = 'manual' | 'task';
 
+/** 采集任务的阶段；末尾三项表示任务仍保留，但当前无法继续流转。 */
 export type GatherTaskState =
   | 'moving-to-resource'
   | 'gathering'
@@ -18,12 +29,19 @@ export type GatherTaskState =
   | 'resource-empty'
   | 'blocked';
 
+/** 采集任务引用的资源点与仓库实体，以及当前流转阶段。 */
 export interface GatherTaskData {
   resource: EntityId;
   warehouse: EntityId;
   state: GatherTaskState;
 }
 
+/**
+ * 创建一套彼此独立的游戏世界和组件存储，并按当前配置生成初始实体。
+ *
+ * 返回的世界同时保存 ECS 组件、单位遍历顺序，以及当前单一领袖、工人、
+ * 资源点和仓库的便捷引用。这些特殊引用是现阶段初始化约定，不是通用实体分类。
+ */
 export function createGameWorld() {
   const Position = { x: [] as number[], y: [] as number[] };
   const Health = { current: [] as number[], maximum: [] as number[] };
@@ -65,6 +83,10 @@ export function createGameWorld() {
 
 export type GameWorld = ReturnType<typeof createGameWorld>;
 
+/**
+ * 在连续世界坐标 `(x, y)` 创建单位，并将其追加到固定 Tick 使用的遍历顺序。
+ * 新单位具有 Position、Health 和 Carrier 组件；不会自动获得移动或采集任务。
+ */
 export function spawnUnit(world: GameWorld, x: number, y: number): EntityId {
   const { Position, Health, Carrier } = world.components;
   const unit = addEntity(world);
@@ -81,6 +103,12 @@ export function spawnUnit(world: GameWorld, x: number, y: number): EntityId {
   return unit;
 }
 
+/**
+ * 销毁一个由 `world.units` 管理的单位。
+ *
+ * 成功时先移出单位遍历列表并清除引用对象的移动、采集数据，再交由 bitECS
+ * 移除实体；传入非单位或已销毁的 EntityId 时不修改世界并返回 `false`。
+ */
 export function despawnUnit(world: GameWorld, unit: EntityId): boolean {
   const index = world.units.indexOf(unit);
   if (index < 0) return false;
@@ -91,4 +119,5 @@ export function despawnUnit(world: GameWorld, unit: EntityId): boolean {
   return true;
 }
 
+/** 浏览器运行时共享的默认世界；测试可调用 `createGameWorld` 获取隔离实例。 */
 export const gameWorld = createGameWorld();

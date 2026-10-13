@@ -1,6 +1,16 @@
+/**
+ * Developer Console 的 DOM 适配层。
+ *
+ * 本模块把控件操作转换为带类型的 `DeveloperAction`，并渲染场景提供的只读快照；
+ * 它不直接导入或修改核心世界。具体调试动作及验证场景仍由 GameScene 执行。
+ */
+import { FloatingPanel } from '../ui/FloatingPanel';
+
+/** 当前可由调试台启动的交互式验证场景。 */
 export type ScenarioName = 'multi-gather' | 'detour' | 'warehouse-near-full' | 'blocked-path';
 export type PathMode = 'off' | 'selected' | 'all';
 
+/** 调试台发给场景的用户意图；不携带核心状态引用。 */
 export type DeveloperAction =
   | { type: 'toggle-pause' }
   | { type: 'step' }
@@ -26,6 +36,7 @@ export interface DeveloperSystemSnapshot {
   detail: string;
 }
 
+/** 场景生成、调试台消费的只读展示数据结构。 */
 export interface DeveloperSnapshot {
   paused: boolean;
   speed: number;
@@ -40,8 +51,10 @@ export interface DeveloperSnapshot {
   systems: DeveloperSystemSnapshot[];
 }
 
+/** 绑定既有调试 DOM，并通过 FloatingPanel 管理其显示与位置。 */
 export class DeveloperConsole {
   readonly #root: HTMLElement;
+  readonly #floatingPanel: FloatingPanel;
   readonly #onAction: (action: DeveloperAction) => void;
   readonly #pathMode: HTMLSelectElement;
   readonly #speed: HTMLSelectElement;
@@ -53,9 +66,19 @@ export class DeveloperConsole {
   readonly #events: HTMLElement;
   readonly #scenarioResult: HTMLElement;
 
-  constructor(root: HTMLElement, onAction: (action: DeveloperAction) => void) {
+  constructor(root: HTMLElement, viewport: HTMLElement, onAction: (action: DeveloperAction) => void) {
     this.#root = root;
     this.#onAction = onAction;
+    root.hidden = false;
+    this.#floatingPanel = new FloatingPanel(viewport, {
+      title: '世界调试台',
+      triggerLabel: '展开或收起开发者控制台',
+      triggerText: '⌘',
+      content: root,
+      initialPosition: { x: viewport.clientWidth - 70, y: 18 },
+      showHeader: false,
+      bodyClass: 'floating-panel__body--developer',
+    });
     this.#pathMode = this.#get('#dev-path-mode');
     this.#speed = this.#get('#dev-speed');
     this.#mapEditing = this.#get('#dev-map-edit');
@@ -77,6 +100,12 @@ export class DeveloperConsole {
     this.#pathMode.value = mode;
   }
 
+  destroy(): void {
+    this.#floatingPanel.destroy();
+    this.#root.hidden = true;
+  }
+
+  /** 将最新场景快照整体写入状态区、实体表和系统列表。 */
   update(snapshot: DeveloperSnapshot): void {
     this.#status.textContent = snapshot.paused ? 'PAUSED' : 'RUNNING';
     this.#status.dataset.state = snapshot.paused ? 'paused' : 'running';
@@ -110,6 +139,7 @@ export class DeveloperConsole {
     }));
   }
 
+  /** 在事件列表顶部追加带本地时间的记录，并只保留最近 60 条。 */
   log(message: string, level: 'info' | 'ok' | 'warning' | 'error' = 'info'): void {
     const item = document.createElement('li');
     item.dataset.level = level;
@@ -146,7 +176,7 @@ export class DeveloperConsole {
     }));
     this.#get<HTMLButtonElement>('[data-dev-action="clear-events"]').addEventListener('click', () => this.#events.replaceChildren());
     this.#get<HTMLButtonElement>('[data-dev-action="collapse"]').addEventListener('click', () => {
-      this.#root.classList.toggle('is-collapsed');
+      this.#floatingPanel.toggle();
     });
   }
 
